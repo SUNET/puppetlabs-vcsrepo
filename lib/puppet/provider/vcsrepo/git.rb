@@ -3,15 +3,21 @@ require File.join(File.dirname(__FILE__), '..', 'vcsrepo')
 Puppet::Type.type(:vcsrepo).provide(:git, :parent => Puppet::Provider::Vcsrepo) do
   desc "Supports Git repositories"
 
-  commands :git => 'git'
+  has_command(:git, 'git') do
+    environment({ 'HOME' => ENV['HOME'] })
+  end
 
   has_features :bare_repositories, :reference_tracking, :ssh_identity, :multiple_remotes, :user, :depth, :branch, :submodules
 
   def create
-    if @resource.value(:revision) and @resource.value(:ensure) == :bare
+    if @resource.value(:revision) and ensure_bare_or_mirror?
       fail("Cannot set a revision (#{@resource.value(:revision)}) on a bare repository")
     end
     if !@resource.value(:source)
+      if @resource.value(:ensure) == :mirror
+        fail("Cannot init repository with mirror option, try bare instead")
+      end
+
       init_repository(@resource.value(:path))
     else
       clone_repository(default_url, @resource.value(:path))
@@ -20,7 +26,7 @@ Puppet::Type.type(:vcsrepo).provide(:git, :parent => Puppet::Provider::Vcsrepo) 
       if @resource.value(:revision)
         checkout
       end
-      if @resource.value(:ensure) != :bare && @resource.value(:submodules) == :true
+      if !ensure_bare_or_mirror? && @resource.value(:submodules) == :true
         update_submodules
       end
 
@@ -83,7 +89,7 @@ Puppet::Type.type(:vcsrepo).provide(:git, :parent => Puppet::Provider::Vcsrepo) 
       end
     end
     #TODO Would this ever reach here if it is bare?
-    if @resource.value(:ensure) != :bare && @resource.value(:submodules) == :true
+    if !ensure_bare_or_mirror? && @resource.value(:submodules) == :true
       update_submodules
     end
     update_owner_and_excludes
@@ -91,6 +97,10 @@ Puppet::Type.type(:vcsrepo).provide(:git, :parent => Puppet::Provider::Vcsrepo) 
 
   def bare_exists?
     bare_git_config_exists? && !working_copy_exists?
+  end
+
+  def ensure_bare_or_mirror?
+    [:bare, :mirror].include? @resource.value(:ensure)
   end
 
   # If :source is set to a hash (for supporting multiple remotes),
@@ -195,9 +205,12 @@ Puppet::Type.type(:vcsrepo).provide(:git, :parent => Puppet::Provider::Vcsrepo) 
     if @resource.value(:branch)
       args.push('--branch', @resource.value(:branch).to_s)
     end
-    if @resource.value(:ensure) == :bare
-      args << '--bare'
+
+    case @resource.value(:ensure)
+    when :bare then args << '--bare'
+    when :mirror then args << '--mirror'
     end
+
     if @resource.value(:remote) != 'origin'
       args.push('--origin', @resource.value(:remote))
     end
@@ -317,7 +330,7 @@ Puppet::Type.type(:vcsrepo).provide(:git, :parent => Puppet::Provider::Vcsrepo) 
   def remote_branch_revision?(revision = @resource.value(:revision))
     # git < 1.6 returns '#{@resource.value(:remote)}/#{revision}'
     # git 1.6+ returns 'remotes/#{@resource.value(:remote)}/#{revision}'
-    branch = at_path { branches.grep /(remotes\/)?#{@resource.value(:remote)}\/#{revision}/ }
+    branch = at_path { branches.grep /(remotes\/)?#{@resource.value(:remote)}\/#{revision}$/ }
     branch unless branch.empty?
   end
 
@@ -443,6 +456,7 @@ Puppet::Type.type(:vcsrepo).provide(:git, :parent => Puppet::Provider::Vcsrepo) 
     if @resource.value(:identity)
       Tempfile.open('git-helper', Puppet[:statedir]) do |f|
         f.puts '#!/bin/sh'
+        f.puts 'export SSH_AUTH_SOCKET='
         f.puts "exec ssh -oStrictHostKeyChecking=no -oPasswordAuthentication=no -oKbdInteractiveAuthentication=no -oChallengeResponseAuthentication=no -oConnectTimeout=120 -i #{@resource.value(:identity)} $*"
         f.close
 
@@ -457,7 +471,8 @@ Puppet::Type.type(:vcsrepo).provide(:git, :parent => Puppet::Provider::Vcsrepo) 
         return ret
       end
     elsif @resource.value(:user) and @resource.value(:user) != Facter['id'].value
-      Puppet::Util::Execution.execute("git #{args.join(' ')}", :uid => @resource.value(:user), :failonfail => true)
+      env = Etc.getpwnam(@resource.value(:user))
+      Puppet::Util::Execution.execute("git #{args.join(' ')}", :uid => @resource.value(:user), :failonfail => true, :custom_environment => {'HOME' => env['dir']})
     else
       git(*args)
     end
